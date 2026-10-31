@@ -148,7 +148,7 @@ describe("parseRepository", () => {
       directory: "Hello-World",
     });
     expect(parseRepository("https://example.test/a/b.git").directory).toBe("b");
-    expect(() => parseRepository("http://github.com/a/b")).toThrow("https");
+    expect(() => parseRepository("http://github.com/a/b", {})).toThrow("https");
     expect(() => parseRepository("https://user:pw@github.com/a/b")).toThrow("without a username");
     expect(() => parseRepository("git@github.com:a/b.git")).toThrow();
   });
