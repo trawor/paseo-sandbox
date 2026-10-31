@@ -1,6 +1,6 @@
 # Sandbox
 
-> Fork of [`@omercnet/paseo-sandbox`](https://github.com/omercnet/paseo-plugins/tree/main/sandbox) 0.3.0 (MIT) that lets each project choose its runtime image with `.paseo.Dockerfile` or `.paseo/sandbox.json`. See [Project runtime images](#project-runtime-images).
+> Fork of [`@omercnet/paseo-sandbox`](https://github.com/omercnet/paseo-plugins/tree/main/sandbox) 0.3.0 (MIT) that runs local folders as well as repositories, lets each project choose its runtime image with `.paseo.Dockerfile` or `.paseo/sandbox.json`, and mounts extra folders from JSON config. See [Local folders and mounts](#local-folders-and-mounts) and [Project runtime images](#project-runtime-images).
 
 A Paseo plugin that runs a project's workspaces, agents and terminals inside a Docker container with its own Paseo daemon. See [OVERVIEW.md](OVERVIEW.md) for behavior and limits.
 
@@ -30,6 +30,12 @@ To add a provider, implement the interface and pass it to `createSandboxService`
 
 The plugin bundle cannot read sibling files, so `server/docker/image.ts` embeds the Dockerfile. After editing it, run `npm run embed:dockerfile`; a test fails when they differ. The image tag is derived from the file, so an updated plugin builds a new image once.
 
+## Local folders and mounts
+
+`sandbox.create` takes exactly one of `repoUrl` and `localPath` (plus an optional `target`, and a `name` that defaults to the repository or folder name). `server/mounts.ts` validates a local folder: `~` is expanded against the daemon user's home, the path is resolved with `realpath`, it must be a folder, and `/`, the home folder and its parents are refused. The default target is `/workspace/<folder name>` with characters outside `[A-Za-z0-9_.-]` replaced, not the host path: a macOS `/Users/...` path inside the container would sit under folders the sandbox user does not own. The record keeps `localPath` and `localTarget`; at each start the folder is checked again, mounted read-write as a `HostMount`, and opened with `hosts.openWorkspace` after `test -d`, instead of cloning.
+
+Extra mounts reuse the same `HostMount` list as shared host logins. `mountsSchema` (strict, max 16, unique targets, `readOnly` default true, no target at/under/above `/home/paseo` or on system folders, no comma or quote since `--mount` cannot carry them) is used by both the host config and `.paseo/sandbox.json`. `resolveImage` collects host config mounts, then project mounts, and refuses a project `mounts` unless the project is a local folder (`trusted`). For a local folder the project config, `.paseo.Dockerfile`, Dockerfile and context are read in place (`localCheckout`: no fetch, nothing removed). `resolveMounts` expands `~`, requires each source to exist, and rejects a target already taken by a login mount, the project folder or an earlier entry, naming the config key. Project env and the extra mount set are folded into the provider revision, so a change recreates the container through the existing revision check and keeps the volume.
+
 ## Project runtime images
 
 The project is cloned inside the container after the container exists, so the image cannot come from that checkout. `server/project-files.ts` therefore reads the default branch on the Paseo host first: `git clone --depth 1 --filter=blob:none --no-checkout` plus a non-cone sparse checkout of `/.paseo/sandbox.json` and `/.paseo.Dockerfile` into a private temp folder, then `sparse-checkout add` for a configured Dockerfile or context. Only those blobs are downloaded. It reuses the URL parsing of `server/repository.ts` and the GitHub token the sandbox itself clones with, passed as an `http.https://github.com/.extraheader` through `GIT_CONFIG_*` environment variables (never argv, never a file, never sent to another host). Plain git was chosen over the GitHub contents API because the plugin already accepts any https git host, and over a throwaway container because it needs no image before the image is known. Before building, the `.git` folder is removed so a context is plain files; the temp folder is deleted after the build.
@@ -42,7 +48,7 @@ The project is cloned inside the container after the container exists, so the im
 
 Project `env` values join the provider revision (the stored credential revision, and so the "stale" flag, is unchanged). `sandbox.start` takes `rebuild: true` for `--no-cache` (or a fresh pull). `PASEO_SANDBOX_ALLOW_INSECURE_REPOS=1` lets `parseRepository` accept plain `http://` URLs; it exists only for end-to-end tests against a local git server and must not be set otherwise.
 
-Examples: [`examples/.paseo.Dockerfile`](examples/.paseo.Dockerfile), [`examples/.paseo/sandbox.json`](examples/.paseo/sandbox.json) with [`examples/docker/`](examples/docker). Install as root with `HOME=/root` in your Dockerfile: the base image points `HOME` at `/home/paseo`, and root-owned files there end up in the sandbox user's volume.
+Examples: [`examples/.paseo.Dockerfile`](examples/.paseo.Dockerfile), [`examples/.paseo/sandbox.json`](examples/.paseo/sandbox.json) with [`examples/docker/`](examples/docker); for a local folder with mounts, [`examples/local-folder/.paseo/sandbox.json`](examples/local-folder/.paseo/sandbox.json); host config, [`examples/host-config.json`](examples/host-config.json) (copy to `$PASEO_HOME/plugin-data/sandbox/config.json`). Install as root with `HOME=/root` in your Dockerfile: the base image points `HOME` at `/home/paseo`, and root-owned files there end up in the sandbox user's volume.
 
 ## Credentials
 
@@ -88,6 +94,7 @@ Remove leftovers with `docker rm -f` and `docker volume rm` on names starting `p
 
 - `shared/`: RPC contracts and the credential presets.
 - `server/provider.ts`: the sandbox-provider interface. `server/docker/`: the Docker implementation (`provider.ts`, `cli.ts`, generated `image.ts`).
+- `server/mounts.ts`: mount and local-folder validation and resolution.
 - `server/project-image.ts`, `server/project-files.ts`, `server/docker/recipe.ts`: per-project image resolution, the host-side sparse fetch, tags and the contract check.
 - `server/service.ts`: create, start, stop, remove, pairing, cloning and host registration. `server/hosts.ts` is the slice of connected hosts it uses.
 - `server/credentials.ts`, `server/store.ts`, `server/host-logins.ts`: saved credentials, shared host logins, the sandbox environment and the private state file. `server/pairing.ts`, `server/repository.ts`: relay connection string and project URL parsing.

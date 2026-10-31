@@ -6,7 +6,7 @@ import { createDockerProvider } from "./server/docker/provider";
 import { hostGithubToken, hostLoginMounts } from "./server/host-logins";
 import { sandboxHosts } from "./server/hosts";
 import { openProjectCheckout } from "./server/project-files";
-import { loadPluginImageConfig, resolveImage } from "./server/project-image";
+import { loadPluginImageConfig, localCheckout, resolveImage } from "./server/project-image";
 import { parseRepository } from "./server/repository";
 import { createSandboxService, type ProjectImages } from "./server/service";
 import { defaultStatePath, Store } from "./server/store";
@@ -28,11 +28,18 @@ import {
 /** Project `.paseo/sandbox.json` / `.paseo.Dockerfile`, then host defaults, then built-in. */
 function projectImages(configPath: string): ProjectImages {
   return {
-    async resolve({ repoUrl, githubToken, rebuild }) {
+    async resolve({ repoUrl, localPath, githubToken, rebuild }) {
       return resolveImage({
         // Read on every start, so a changed setting applies without restarting Paseo.
         config: await loadPluginImageConfig(configPath),
-        openProject: () => openProjectCheckout(parseRepository(repoUrl).url, { githubToken }),
+        // A local folder is the user's own and is read in place; a repository is fetched and
+        // its config is untrusted.
+        openProject: async () =>
+          localPath
+            ? localCheckout(localPath)
+            : openProjectCheckout(parseRepository(repoUrl ?? "").url, { githubToken }),
+        trusted: Boolean(localPath),
+        hostConfigPath: configPath,
         rebuild,
       });
     },

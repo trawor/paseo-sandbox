@@ -1,12 +1,17 @@
 Sandbox runs one project in its own Docker container. The container holds a complete Paseo daemon, so the project's workspaces, agents, terminals and Git commands all execute inside it instead of on your machine. Paseo shows the project in the normal sidebar as a connected host, and its agents appear under the Subagents track of any agent that starts them.
 
-Open **Sandboxes** in the sidebar, enter a project (`owner/repo` on GitHub or an https URL) and press Create. The plugin builds the runtime image the first time, starts the container, clones the project inside it, registers the container as a host and opens the project. Stop keeps the project data. Remove deletes the container and everything stored in it.
+Open **Sandboxes** in the sidebar, pick a source and press Create:
+
+- **Local folder** (the default): a folder on the machine that runs the Paseo daemon, as an absolute path or `~/...`. It is bind-mounted read-write at `/workspace/<folder name>` (or the **Path in sandbox** you enter) and opened there; nothing is cloned or copied, so edits inside the sandbox are edits to your folder, and untracked files are there too.
+- **GitHub repository**: `owner/repo` on GitHub or an https URL, cloned inside the sandbox.
+
+The plugin builds the runtime image the first time, starts the container, mounts or clones the project, registers the container as a host and opens the project. Stop keeps the project data. Remove deletes the container and everything stored in its volume; a local folder itself is never deleted.
 
 The plugin only provisions. Each sandbox is saved as an ordinary connected host, so its connection status, label and metadata can be inspected and edited in the Connected hosts plugin, or with `paseo host`. Starting a sandbox refreshes only its connection and re-enables it; it never rewrites a label or metadata you changed.
 
 ## Project runtime images
 
-Each sandbox runs the built-in runtime image unless the project brings its own. When a sandbox is created or started, the plugin reads the project's default branch on this host (a shallow, sparse fetch of only the files below, with the same GitHub token the sandbox clones with) and picks the first match:
+Each sandbox runs the built-in runtime image unless the project brings its own. When a sandbox is created or started, the plugin reads the project on this host and picks the first match. A local folder is read in place, including uncommitted files. A repository is read from its default branch through a shallow, sparse fetch of only the files below, with the same GitHub token the sandbox clones with.
 
 1. **`.paseo/sandbox.json`** in the project, a small config file (see below).
 2. **`.paseo.Dockerfile`** at the project root.
@@ -42,8 +47,29 @@ The plugin builds the built-in image first and passes its tag as `BASE_IMAGE`. A
 - `buildArgs`, `env`: non-secret values only. Names that look like secrets (`*TOKEN*`, `*KEY*`, `*SECRET*`, `*PASSWORD*`) and names the plugin sets are refused. `env` reaches the sandbox daemon; saved credentials win over it.
 - `image`: a prebuilt image to pull and run instead of building (not with `dockerfile` or `context`).
 - `extends`: `builtin` or `none`, to override the `BASE_IMAGE` detection.
+- `mounts`: extra host folders or files, **local-folder sandboxes only** (see below).
 
 An image is built once per content: the tag is a digest of the Dockerfile, build arguments, context files and the built-in image it extends. Start or Restart reads the project again, so after you push a changed Dockerfile the next start builds it and recreates the container, keeping `/home/paseo` (checkout, logins, history). **Rebuild image** on the Sandboxes screen rebuilds without the layer cache (or pulls the image again) and recreates the sandbox the same way. The project checkout inside the sandbox is not pulled by this.
+
+## Extra mounts
+
+Both the host config and a local project's `.paseo/sandbox.json` accept `mounts`:
+
+```json
+{
+  "mounts": [
+    { "source": "~/datasets", "target": "/data" },
+    { "source": "/Users/me/.cache/pip", "target": "/opt/pip-cache", "readOnly": false }
+  ]
+}
+```
+
+- `source`: absolute, or `~/` for the Paseo daemon user's home. It must exist; a missing one stops the start and names the entry, e.g. `.paseo/sandbox.json mounts[1].source`.
+- `target`: absolute and normalized (no `..`, `//` or trailing slash). Not at, under or above `/home/paseo`, which is the sandbox's own volume, and not a system folder (`/etc`, `/usr`, `/proc`, ...) or `/`, `/workspace`, `/tmp`, `/opt`, `/home` themselves (paths below them are fine).
+- `readOnly`: `true` unless set to `false`.
+- At most 16 per file; no target twice. Host config mounts come first, then the project's; a later entry on a target that is already taken (including the local project folder's own path) is an error naming both.
+- A **repository's** `.paseo/sandbox.json` may not set `mounts`: anyone who can push would choose which of your folders the sandbox sees. Such a config is refused with an error that points at the host config. Host config mounts apply to every sandbox, repository or local.
+- Changing the mount set recreates the container on the next start, keeping `/home/paseo`.
 
 Host settings, in `plugin-data/sandbox/config.json` (environment variables win, both are read at every start):
 
@@ -54,8 +80,9 @@ Host settings, in `plugin-data/sandbox/config.json` (environment variables win, 
 | `defaultContext` (absolute path) | `PASEO_SANDBOX_DEFAULT_CONTEXT` | Build context for that Dockerfile |
 | `defaultImage` | `PASEO_SANDBOX_DEFAULT_IMAGE` | Prebuilt image for projects without their own; wins over `defaultDockerfile` |
 | `defaultBuildArgs` | | Build arguments for `defaultDockerfile` |
+| `mounts` | | Extra mounts for every sandbox (see above) |
 
-Building a project's Dockerfile runs its `RUN` steps on this host's Docker, so with `auto` anyone who can push to a project's default branch chooses what is built here; set `projectDockerfile` to `off` for projects you do not trust.
+Building a project's Dockerfile runs its `RUN` steps on this host's Docker, so with `auto` anyone who can push to a project's default branch chooses what is built here; set `projectDockerfile` to `off` for projects you do not trust. `off` also stops reading a local folder's `.paseo/sandbox.json`, including its `mounts`; host config mounts still apply.
 
 ## Setup
 
@@ -82,7 +109,7 @@ Every sandbox receives the saved values when it starts. Changing a value marks r
 
 Credentials and sandbox records live in a private file under the daemon's Paseo home, `plugin-data/sandbox/state.json`, readable only by the daemon user. They are never sent to the app, never shown again after saving, and are written only to the sandboxes that start afterwards. The daemon also stores each sandbox's random connection password, as Paseo does for any connected host.
 
-The app reaches a sandbox through Paseo's relay over TLS with end-to-end encryption and that password. The container publishes no ports, mounts only its own volume unless you share a host login, has no Docker socket, drops all but four Linux capabilities and runs agents as a non-root user.
+The app reaches a sandbox through Paseo's relay over TLS with end-to-end encryption and that password. The container publishes no ports, mounts only its own volume plus a local project folder and the extra mounts you configured, and your agent folders if you share a host login, has no Docker socket, drops all but four Linux capabilities and runs agents as a non-root user.
 
 ## Limits
 
@@ -93,5 +120,6 @@ The app reaches a sandbox through Paseo's relay over TLS with end-to-end encrypt
 - On macOS Claude keeps its login in the Keychain, not in a folder, so there is nothing to mount.
 - The built-in image has no `gh` CLI, so pull request status and creation are unavailable inside a sandbox unless the project's `.paseo.Dockerfile` adds it. Agents can still push with the GitHub token.
 - Project images are read from the default branch, not from the branch checked out inside the sandbox. Old project images are not deleted; remove unused `paseo-sandbox-project:*` tags with `docker image rm` or `docker image prune`.
+- A local folder is mounted read-write: an agent in the sandbox can change or delete anything in it, including `.git`. On Linux, bind mounts keep host ownership and the sandbox user is uid 1000, so the folder (and read-write extra mounts) must be writable by uid 1000; the plugin logs a warning when the folder's owner is another uid. Docker Desktop on macOS maps ownership, so this does not apply there. The folder is resolved on the daemon's machine, so a remote Paseo host mounts its own folders, not the app's, and Docker must see the same paths as the daemon (a remote `DOCKER_HOST` does not; the error then says the folder does not exist on the Docker host).
 - A rejected or revoked key shows up as an error in the agent's conversation. Only the Claude token has a known lifetime.
 - Clients that were already open when a sandbox was removed can keep showing its projects until their cached host data is cleared.

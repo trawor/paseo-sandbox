@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { lstat, readdir, readFile, readlink } from "node:fs/promises";
 import { isAbsolute, join, posix } from "node:path";
 import { z } from "zod";
+import { type LabeledMount, mountsSchema } from "./mounts";
 import type { ImageRecipe, ImageRequest } from "./provider";
 
 /** The optional project config, read from the default branch before the sandbox exists. */
@@ -59,6 +60,11 @@ export const projectConfigSchema = z
      * Dockerfile alone. Default: `builtin` when the Dockerfile mentions BASE_IMAGE.
      */
     extends: z.enum(["builtin", "none"]).optional(),
+    /**
+     * Extra host folders. Honored only for local-folder sandboxes, whose folder is the user's own;
+     * a repository's config is untrusted and is refused when it sets them.
+     */
+    mounts: mountsSchema,
   })
   .strict()
   .refine((config) => !(config.image && (config.dockerfile || config.context)), {
@@ -78,6 +84,8 @@ export const pluginImageConfigSchema = z
     defaultContext: absolutePath.nullable().default(null),
     defaultImage: z.string().min(1).nullable().default(null),
     defaultBuildArgs: variables,
+    /** Extra host folders mounted into every sandbox. Trusted: only the host's owner writes it. */
+    mounts: mountsSchema,
   })
   .strict();
 export type PluginImageConfig = z.infer<typeof pluginImageConfigSchema>;
@@ -156,6 +164,8 @@ export interface ResolvedImage {
   request: ImageRequest;
   /** Variables from the project config, applied under the saved credentials. */
   env: Record<string, string>;
+  /** Host config mounts, then project config mounts, not yet checked against the host. */
+  mounts: LabeledMount[];
   /** Removes fetched files. Call after the image is built. */
   dispose(): Promise<void>;
 }
@@ -222,10 +232,19 @@ async function dockerfileRecipe(
 
 const noop = async () => undefined;
 
+/** A local folder read in place: untracked files count, and nothing is fetched or removed. */
+export function localCheckout(dir: string): ProjectCheckout {
+  return { dir, commit: "", include: noop, seal: noop, dispose: noop };
+}
+
 export interface ResolveOptions {
   config: PluginImageConfig;
   /** Fetches `.paseo/sandbox.json` and `.paseo.Dockerfile`; only called when the switch is on. */
   openProject: () => Promise<ProjectCheckout>;
+  /** The project is the user's own folder, so its config may mount host folders. */
+  trusted?: boolean;
+  /** Where the host config lives, for messages. */
+  hostConfigPath?: string;
   rebuild?: boolean;
   /** Reads a host file; injectable for tests. */
   readHostFile?: (path: string) => Promise<string>;
@@ -233,12 +252,27 @@ export interface ResolveOptions {
 
 /**
  * Picks the sandbox image. First hit wins: the project's `.paseo/sandbox.json`, the project's
- * `.paseo.Dockerfile`, the host-wide default, the built-in runtime.
+ * `.paseo.Dockerfile`, the host-wide default, the built-in runtime. Mounts are collected from the
+ * host config and, for a trusted project, from its config.
  */
 export async function resolveImage(options: ResolveOptions): Promise<ResolvedImage> {
   const { config, rebuild } = options;
   const readHostFile = options.readHostFile ?? ((path: string) => readFile(path, "utf8"));
+  const hostConfig = options.hostConfigPath ?? "the host config";
   let env: Record<string, string> = {};
+  let projectMounts: LabeledMount[] = [];
+  const done = (request: ImageRequest, dispose: () => Promise<void> = noop): ResolvedImage => ({
+    request,
+    env,
+    mounts: [
+      ...config.mounts.map((mount, index) => ({
+        ...mount,
+        origin: `${hostConfig} mounts[${index}]`,
+      })),
+      ...projectMounts,
+    ],
+    dispose,
+  });
 
   if (config.projectDockerfile === "auto") {
     const checkout = await options.openProject();
@@ -247,17 +281,23 @@ export async function resolveImage(options: ResolveOptions): Promise<ResolvedIma
       const configText = await readPlainFile(checkout.dir, PROJECT_CONFIG_PATH);
       const project = configText === null ? null : parseProjectConfig(configText);
       env = project?.env ?? {};
+      if (project && project.mounts.length > 0) {
+        if (!options.trusted)
+          throw new Error(
+            `${PROJECT_CONFIG_PATH} sets \`mounts\`, which a repository's config may not do: it would let anyone who can push choose host folders to expose. Add the mounts to ${hostConfig} instead, or run the project as a local-folder sandbox.`,
+          );
+        projectMounts = project.mounts.map((mount, index) => ({
+          ...mount,
+          origin: `${PROJECT_CONFIG_PATH} mounts[${index}]`,
+        }));
+      }
       if (project?.image) {
         await checkout.dispose();
-        return {
-          request: {
-            recipe: { kind: "image", image: project.image },
-            source: `the project's ${PROJECT_CONFIG_PATH}${at}`,
-            rebuild,
-          },
-          env,
-          dispose: noop,
-        };
+        return done({
+          recipe: { kind: "image", image: project.image },
+          source: `the project's ${PROJECT_CONFIG_PATH}${at}`,
+          rebuild,
+        });
       }
       const dockerfilePath = project?.dockerfile ?? PROJECT_DOCKERFILE_PATH;
       const context = project?.context ?? null;
@@ -266,7 +306,7 @@ export async function resolveImage(options: ResolveOptions): Promise<ResolvedIma
       const dockerfile = await readPlainFile(checkout.dir, dockerfilePath);
       if (dockerfile === null && project?.dockerfile)
         throw new Error(
-          `${PROJECT_CONFIG_PATH} names ${project.dockerfile}, which is not in the project's default branch.`,
+          `${PROJECT_CONFIG_PATH} names ${project.dockerfile}, which is not in the project${checkout.commit ? "'s default branch" : " folder"}.`,
         );
       if (dockerfile !== null) {
         await checkout.seal();
@@ -281,8 +321,8 @@ export async function resolveImage(options: ResolveOptions): Promise<ResolvedIma
         const source = project
           ? `the project's ${dockerfilePath} (via ${PROJECT_CONFIG_PATH})${at}`
           : `the project's ${PROJECT_DOCKERFILE_PATH}${at}`;
-        return {
-          request: {
+        return done(
+          {
             recipe: await dockerfileRecipe(
               dockerfile,
               contextDir,
@@ -292,9 +332,8 @@ export async function resolveImage(options: ResolveOptions): Promise<ResolvedIma
             source,
             rebuild,
           },
-          env,
-          dispose: () => checkout.dispose(),
-        };
+          () => checkout.dispose(),
+        );
       }
       await checkout.dispose();
     } catch (error) {
@@ -304,35 +343,23 @@ export async function resolveImage(options: ResolveOptions): Promise<ResolvedIma
   }
 
   if (config.defaultImage)
-    return {
-      request: {
-        recipe: { kind: "image", image: config.defaultImage },
-        source: "the host's default image setting",
-        rebuild,
-      },
-      env,
-      dispose: noop,
-    };
+    return done({
+      recipe: { kind: "image", image: config.defaultImage },
+      source: "the host's default image setting",
+      rebuild,
+    });
   if (config.defaultDockerfile) {
     const dockerfile = await readHostFile(config.defaultDockerfile);
-    return {
-      request: {
-        recipe: await dockerfileRecipe(
-          dockerfile,
-          config.defaultContext,
-          config.defaultBuildArgs,
-          undefined,
-        ),
-        source: `the host's default Dockerfile ${config.defaultDockerfile}`,
-        rebuild,
-      },
-      env,
-      dispose: noop,
-    };
+    return done({
+      recipe: await dockerfileRecipe(
+        dockerfile,
+        config.defaultContext,
+        config.defaultBuildArgs,
+        undefined,
+      ),
+      source: `the host's default Dockerfile ${config.defaultDockerfile}`,
+      rebuild,
+    });
   }
-  return {
-    request: { recipe: { kind: "builtin" }, source: "the built-in runtime", rebuild },
-    env,
-    dispose: noop,
-  };
+  return done({ recipe: { kind: "builtin" }, source: "the built-in runtime", rebuild });
 }

@@ -1,6 +1,6 @@
 {
   "name": "@trawor/paseo-sandbox",
-  "version": "0.4.0-fork.1",
+  "version": "0.4.0-fork.2",
   "type": "module",
   "description": "Run a project's Paseo workspaces, agents and terminals inside an isolated sandbox, with a per-project runtime image (.paseo.Dockerfile / .paseo/sandbox.json). Fork of @omercnet/paseo-sandbox.",
   "license": "MIT",

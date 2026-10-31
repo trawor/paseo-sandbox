@@ -9,12 +9,20 @@ import {
   type SettingsInputHandle,
   SettingsRow,
   SettingsSection,
+  SettingsSelect,
 } from "@getpaseo/plugin/client/ui";
 import { useMemo, useRef, useState } from "react";
 import { Text } from "react-native";
 import type { Sandbox } from "../shared/sandbox";
 import { useCredentials, useSandboxActions, useSandboxes } from "./queries";
-import { describeSandbox, hasModelCredential, needsRestart, repositoryName } from "./view-model";
+import {
+  describeSandbox,
+  folderName,
+  hasModelCredential,
+  needsRestart,
+  repositoryName,
+  sandboxSource,
+} from "./view-model";
 
 interface SandboxCardProps {
   hostId: string;
@@ -33,7 +41,7 @@ function SandboxCard({ hostId, theme, sandbox }: SandboxCardProps) {
     <SettingsSection title={sandbox.name}>
       <SettingsCard>
         <SettingsRow
-          label={sandbox.repoUrl ?? "Sandbox"}
+          label={sandboxSource(sandbox)}
           hint={describeSandbox(sandbox)}
           error={failure?.error?.message}
         />
@@ -103,40 +111,84 @@ function SandboxCard({ hostId, theme, sandbox }: SandboxCardProps) {
   );
 }
 
+type SourceKind = "repo" | "local";
+
+const SOURCE_OPTIONS = [
+  { label: "GitHub repository", value: "repo" },
+  { label: "Local folder", value: "local" },
+] as const satisfies readonly { label: string; value: SourceKind }[];
+
 function CreateSandbox({ hostId }: { hostId: string }) {
   const { create } = useSandboxActions(hostId);
   const nameInput = useRef<SettingsInputHandle>(null);
   const projectInput = useRef<SettingsInputHandle>(null);
+  const targetInput = useRef<SettingsInputHandle>(null);
+  const [kind, setKind] = useState<SourceKind>("local");
   const [name, setName] = useState("");
   const [project, setProject] = useState("");
+  const [target, setTarget] = useState("");
+  const local = kind === "local";
+  function reset() {
+    for (const input of [nameInput, projectInput, targetInput]) input.current?.replaceText("");
+    setName("");
+    setProject("");
+    setTarget("");
+  }
   function submit() {
+    const source = project.trim();
+    const label = name.trim() || (local ? folderName(source) : repositoryName(source));
     create.mutate(
-      { name: name.trim() || repositoryName(project), repoUrl: project.trim() },
-      {
-        onSuccess: () => {
-          nameInput.current?.replaceText("");
-          projectInput.current?.replaceText("");
-          setName("");
-          setProject("");
-        },
-      },
+      local
+        ? { name: label, localPath: source, ...(target.trim() ? { target: target.trim() } : {}) }
+        : { name: label, repoUrl: source },
+      { onSuccess: reset },
     );
   }
   return (
     <SettingsSection title="New sandbox">
       <SettingsCard>
+        <SettingsSelect
+          label="Source"
+          hint={
+            local
+              ? "A folder on the machine that runs Paseo. It is mounted read-write, not copied."
+              : "Cloned inside the sandbox from GitHub or any https Git URL."
+          }
+          value={kind}
+          options={SOURCE_OPTIONS}
+          onValueChange={(value) => {
+            setKind(value);
+            setProject("");
+            setTarget("");
+            create.reset();
+          }}
+        />
         <SettingsInput
+          key={kind}
           ref={projectInput}
-          label="Project"
-          hint="owner/repo on GitHub, or an https URL. It is cloned inside the sandbox."
-          placeholder="owner/repo"
+          label={local ? "Folder" : "Project"}
+          hint={
+            local
+              ? "Absolute path or ~/..., on the Paseo host. Not / or your home folder itself."
+              : "owner/repo on GitHub, or an https URL. It is cloned inside the sandbox."
+          }
+          placeholder={local ? "~/code/my-project" : "owner/repo"}
           onChangeText={setProject}
           error={create.error?.message}
         />
+        {local ? (
+          <SettingsInput
+            ref={targetInput}
+            label="Path in sandbox"
+            hint={`Where the folder appears and opens. Defaults to /workspace/${folderName(project) || "<folder name>"}`}
+            placeholder="/workspace/my-project"
+            onChangeText={setTarget}
+          />
+        ) : null}
         <SettingsInput
           ref={nameInput}
           label="Name"
-          hint="Defaults to the project name"
+          hint={local ? "Defaults to the folder name" : "Defaults to the project name"}
           onChangeText={setName}
         />
         <SettingsAction

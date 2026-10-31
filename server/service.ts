@@ -1,4 +1,5 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { stat } from "node:fs/promises";
 import { setTimeout as sleep } from "node:timers/promises";
 import type { RpcInput } from "@getpaseo/plugin";
 import { CREDENTIAL_PRESETS } from "../shared/credentials";
@@ -6,6 +7,7 @@ import type { createSandbox, Sandbox } from "../shared/sandbox";
 import { sandboxEnvironment } from "./credentials";
 import { ENABLE_OMP } from "./daemon-config";
 import type { SandboxHosts } from "./hosts";
+import { resolveLocalProject, resolveMounts } from "./mounts";
 import { relayConnection } from "./pairing";
 import type { ResolvedImage } from "./project-image";
 import type { HostMount, SandboxProvider } from "./provider";
@@ -28,7 +30,9 @@ export interface HostLogins {
 /** Picks a sandbox's runtime image on the Paseo host, before the sandbox is created. */
 export interface ProjectImages {
   resolve(input: {
-    repoUrl: string;
+    /** Exactly one of `repoUrl` and `localPath` is set. */
+    repoUrl: string | null;
+    localPath: string | null;
     /** The token the sandbox itself would clone with, for reading a private project's config. */
     githubToken: string | undefined;
     rebuild: boolean;
@@ -41,6 +45,7 @@ export const BUILTIN_IMAGES: ProjectImages = {
     return {
       request: { recipe: { kind: "builtin" }, source: "the built-in runtime", rebuild },
       env: {},
+      mounts: [],
       dispose: async () => undefined,
     };
   },
@@ -48,6 +53,14 @@ export const BUILTIN_IMAGES: ProjectImages = {
 
 function sortedJson(values: Record<string, string>) {
   return JSON.stringify(Object.entries(values).sort(([a], [b]) => a.localeCompare(b)));
+}
+
+function mountKey(mounts: readonly HostMount[]) {
+  return JSON.stringify(
+    [...mounts]
+      .sort((a, b) => a.target.localeCompare(b.target))
+      .map(({ source, target, readOnly }) => [source, target, readOnly]),
+  );
 }
 
 /** Lifecycle of project sandboxes. Long operations run in the background and report through `list`. */
@@ -124,7 +137,22 @@ export function createSandboxService(
     const state = await store.read();
     const current = await record(id);
     const { env, hostLogins: shared, revision } = sandboxEnvironment(state, current);
-    const mounts = await hostLogins.mounts(shared);
+    const loginMounts = await hostLogins.mounts(shared);
+    // A local project is checked again at every start: the folder may have moved since.
+    const local = current.localPath
+      ? await resolveLocalProject(current.localPath, current.localTarget ?? undefined)
+      : null;
+    if (local && process.platform === "linux") {
+      // Linux bind mounts keep host ownership; the sandbox user is uid 1000.
+      const { uid } = await stat(local.path);
+      if (uid !== 1000)
+        console.warn(
+          `sandbox ${id}: ${local.path} is owned by uid ${uid}, not 1000; the sandbox user may not be able to write it.`,
+        );
+    }
+    const projectMount: HostMount[] = local
+      ? [{ source: local.path, target: local.target, readOnly: false }]
+      : [];
     if (shared.includes("github")) {
       const token = await hostLogins.githubToken();
       hostTokens.add(token);
@@ -133,24 +161,35 @@ export function createSandboxService(
     setPhase("Reading the project's sandbox image settings");
     const image = await images.resolve({
       repoUrl: current.repoUrl,
+      localPath: local?.path ?? null,
       githubToken: env.GITHUB_TOKEN,
       rebuild,
     });
     let handle: string;
     try {
+      // Host config mounts, then the local project's own, after what the plugin mounts itself.
+      const taken = new Map<string, string>([
+        ...loginMounts.map((mount): [string, string] => [mount.target, "a shared host login"]),
+        ...projectMount.map((mount): [string, string] => [
+          mount.target,
+          "the local project folder",
+        ]),
+      ]);
+      const extraMounts = [...projectMount, ...(await resolveMounts(image.mounts, taken))];
       if (image.request.recipe.kind !== "builtin") setPhase(`Using ${image.request.source}`);
-      // Saved credentials win over project variables, and project variables count as a change.
-      const hasProjectEnv = Object.keys(image.env).length > 0;
+      // Saved credentials win over project variables. Project variables and extra mounts count as
+      // a change, so the container is recreated for them; the /home/paseo volume is kept.
+      const changes = Object.keys(image.env).length > 0 || extraMounts.length > 0;
       handle = await provider.up(
         {
           key: id,
-          revision: hasProjectEnv
+          revision: changes
             ? createHash("sha256")
-                .update(`${revision}\0${sortedJson(image.env)}`)
+                .update(`${revision}\0${sortedJson(image.env)}\0${mountKey(extraMounts)}`)
                 .digest("hex")
             : revision,
           env: { ...image.env, ...env },
-          mounts,
+          mounts: [...loginMounts, ...extraMounts],
           image: image.request,
         },
         setPhase,
@@ -205,8 +244,19 @@ export function createSandboxService(
   }
 
   async function checkout(hosts: SandboxHosts, id: string, serverId: string) {
-    const { handle, repoUrl } = await record(id);
+    const { handle, repoUrl, localTarget } = await record(id);
     if (!handle) throw new Error("The sandbox has no runtime to clone into.");
+    if (localTarget) {
+      // A local folder is mounted, not cloned: open it where it is mounted.
+      await provider.exec({ handle, argv: ["test", "-d", localTarget] }).catch((error) => {
+        throw new Error(
+          `The local folder is not visible at ${localTarget} in the sandbox. ${messageOf(error)}`,
+        );
+      });
+      await hosts.openWorkspace(serverId, localTarget);
+      return;
+    }
+    if (!repoUrl) throw new Error("The sandbox has neither a repository nor a local folder.");
     const { url, directory } = parseRepository(repoUrl);
     const cwd = `/home/paseo/${directory}`;
     const cloned = await provider.exec({ handle, argv: ["test", "-d", `${cwd}/.git`] }).then(
@@ -257,6 +307,8 @@ export function createSandboxService(
             id: item.id,
             name: item.name,
             repoUrl: item.repoUrl,
+            localPath: item.localPath,
+            localTarget: item.localTarget,
             createdAt: item.createdAt,
             runtime,
             host: host
@@ -274,15 +326,22 @@ export function createSandboxService(
     },
 
     async create(hosts: SandboxHosts, input: RpcInput<typeof createSandbox>) {
-      const { url } = parseRepository(input.repoUrl);
+      if (Boolean(input.repoUrl) === Boolean(input.localPath))
+        throw new Error("Give either a repository or a local folder, not both.");
+      const local = input.localPath
+        ? await resolveLocalProject(input.localPath, input.target)
+        : null;
+      const repository = input.repoUrl ? parseRepository(input.repoUrl) : null;
       const problem = await provider.unavailable();
       if (problem) throw new Error(problem);
       const id = randomUUID().slice(0, 12);
       await store.update((draft) => {
         draft.sandboxes[id] = {
           id,
-          name: input.name,
-          repoUrl: url,
+          name: input.name?.trim() || local?.name || repository?.directory || id,
+          repoUrl: repository?.url ?? null,
+          localPath: local?.path ?? null,
+          localTarget: local?.target ?? null,
           handle: null,
           revision: null,
           password: randomBytes(24).toString("base64url"),

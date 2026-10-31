@@ -70,6 +70,8 @@ describe("sandbox environment", () => {
     id: "a",
     name: "n",
     repoUrl: "https://github.com/a/b",
+    localPath: null,
+    localTarget: null,
     handle: null,
     revision: null,
     password: "pw",

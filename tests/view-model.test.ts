@@ -11,6 +11,8 @@ const base: Sandbox = {
   id: "a",
   name: "n",
   repoUrl: "https://github.com/a/b",
+  localPath: null,
+  localTarget: null,
   createdAt: "2026-01-01",
   runtime: "running",
   host: { status: "online", serverId: "srv", error: null },
