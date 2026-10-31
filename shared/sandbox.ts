@@ -7,6 +7,9 @@ export const sandboxSchema = z.object({
   id: z.string(),
   name: z.string(),
   repoUrl: z.string().nullable(),
+  /** The host folder a local-folder sandbox mounts as its project, and where it appears inside. */
+  localPath: z.string().nullable(),
+  localTarget: z.string().nullable(),
   createdAt: z.string(),
   runtime: z.enum(["running", "stopped", "missing"]),
   /** The connected host Paseo shows in its sidebar, once the sandbox registered one. */
@@ -41,14 +44,26 @@ export const listSandboxes = defineRpc({
 
 /**
  * Starts provisioning and answers at once; progress and failure arrive through
- * `sandbox.list` as `busy` and `error`. `repoUrl` is an https URL or `owner/repo` on GitHub.
+ * `sandbox.list` as `busy` and `error`. Exactly one source: `repoUrl` (an https URL or
+ * `owner/repo` on GitHub, cloned inside the sandbox) or `localPath` (an absolute or `~/` folder
+ * on the Paseo host, mounted read-write at `target`, default `/workspace/<folder name>`).
+ * `name` defaults to the repository or folder name.
  */
 export const createSandbox = defineRpc({
   name: "sandbox.create",
-  input: z.object({
-    name: z.string().trim().min(1).max(64),
-    repoUrl: z.string().trim().min(1).max(512),
-  }),
+  input: z
+    .object({
+      name: z.string().trim().max(64).optional(),
+      repoUrl: z.string().trim().min(1).max(512).optional(),
+      localPath: z.string().trim().min(1).max(1024).optional(),
+      target: z.string().trim().min(1).max(1024).optional(),
+    })
+    .refine((input) => Boolean(input.repoUrl) !== Boolean(input.localPath), {
+      message: "Give either a repository or a local folder, not both.",
+    })
+    .refine((input) => !input.target || Boolean(input.localPath), {
+      message: "A sandbox path only applies to a local folder.",
+    }),
   output: z.object({ id: z.string() }),
 });
 

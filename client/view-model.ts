@@ -47,6 +47,18 @@ export function repositoryName(repo: string) {
   );
 }
 
+/** Last path segment of a local folder as typed, for the default sandbox name. */
+export function folderName(path: string) {
+  return path.trim().replace(/\/+$/, "").split("/").at(-1)?.replace(/^~$/, "") ?? "";
+}
+
+/** What the sandbox runs: the repository, or the local folder and where it is mounted. */
+export function sandboxSource(sandbox: Sandbox) {
+  if (sandbox.localPath)
+    return `Local folder ${sandbox.localPath}${sandbox.localTarget ? ` → ${sandbox.localTarget}` : ""}`;
+  return sandbox.repoUrl ?? "Sandbox";
+}
+
 export function hasModelCredential(credentials: readonly CredentialSummary[] | undefined) {
   return credentials?.some((entry) => entry.kind === "model") ?? false;
 }

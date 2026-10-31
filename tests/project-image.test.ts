@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { openProjectCheckout } from "../server/project-files";
 import {
   loadPluginImageConfig,
+  localCheckout,
   type PluginImageConfig,
   type ProjectCheckout,
   parseProjectConfig,
@@ -57,7 +58,7 @@ function checkout() {
 
 describe("project config", () => {
   test("defaults every optional field", () => {
-    expect(parseProjectConfig("{}")).toEqual({ buildArgs: {}, env: {} });
+    expect(parseProjectConfig("{}")).toEqual({ buildArgs: {}, env: {}, mounts: [] });
     expect(parseProjectConfig('{"context": "docker/./"}').context).toBe("docker");
   });
 
@@ -317,5 +318,79 @@ describe("local test repositories", () => {
         PASEO_SANDBOX_ALLOW_INSECURE_REPOS: "1",
       }).directory,
     ).toBe("demo");
+  });
+});
+
+describe("mounts in configs", () => {
+  const MOUNTS = JSON.stringify({
+    mounts: [{ source: "~/datasets", target: "/data" }],
+  });
+  const HOST = { ...AUTO, mounts: [{ source: "/srv/cache", target: "/cache", readOnly: false }] };
+
+  test("a repository's config may not mount host folders", async () => {
+    await files({ ".paseo/sandbox.json": MOUNTS });
+    const { calls, open } = checkout();
+    await expect(
+      resolveImage({ config: AUTO, openProject: open, hostConfigPath: "/p/config.json" }),
+    ).rejects.toThrow(
+      /sets `mounts`, which a repository's config may not do.*Add the mounts to \/p\/config\.json instead/,
+    );
+    expect(calls.disposed).toBeGreaterThan(0);
+  });
+
+  test("a local folder's config may, after the host config's mounts", async () => {
+    await files({ ".paseo/sandbox.json": MOUNTS });
+    const resolved = await resolveImage({
+      config: HOST,
+      openProject: async () => localCheckout(root),
+      trusted: true,
+      hostConfigPath: "/p/config.json",
+    });
+    expect(resolved.mounts).toEqual([
+      {
+        source: "/srv/cache",
+        target: "/cache",
+        readOnly: false,
+        origin: "/p/config.json mounts[0]",
+      },
+      {
+        source: "~/datasets",
+        target: "/data",
+        readOnly: true,
+        origin: ".paseo/sandbox.json mounts[0]",
+      },
+    ]);
+  });
+
+  test("host mounts apply to repository sandboxes and with the switch off", async () => {
+    const repo = await resolveImage({ config: HOST, openProject: checkout().open });
+    expect(repo.mounts.map((mount) => mount.target)).toEqual(["/cache"]);
+    const off = await resolveImage({
+      config: { ...HOST, projectDockerfile: "off" },
+      openProject: checkout().open,
+    });
+    expect(off.mounts.map((mount) => mount.target)).toEqual(["/cache"]);
+  });
+
+  test("a mounts entry in a project config is validated strictly", () => {
+    expect(() =>
+      parseProjectConfig(JSON.stringify({ mounts: [{ source: "/a", target: "/home/paseo/x" }] })),
+    ).toThrow("mounts.0.target may not be at, under or above /home/paseo");
+    expect(() =>
+      parseProjectConfig(JSON.stringify({ mounts: [{ source: "/a", target: "/x", mode: "rw" }] })),
+    ).toThrow("mounts.0");
+  });
+
+  test("a local folder is read in place: untracked files count and nothing is removed", async () => {
+    await files({ ".paseo.Dockerfile": EXTENDING, ".git/HEAD": "ref: refs/heads/main\n" });
+    const resolved = await resolveImage({
+      config: AUTO,
+      openProject: async () => localCheckout(root),
+      trusted: true,
+    });
+    expect(resolved.request.source).toBe("the project's .paseo.Dockerfile");
+    await resolved.dispose();
+    expect(existsSync(join(root, ".git", "HEAD"))).toBe(true);
+    expect(existsSync(join(root, ".paseo.Dockerfile"))).toBe(true);
   });
 });

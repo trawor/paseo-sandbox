@@ -1,0 +1,4 @@
+{
+  "projectDockerfile": "auto",
+  "mounts": [{ "source": "~/shared-references", "target": "/references" }]
+}

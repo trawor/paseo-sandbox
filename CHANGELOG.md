@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.0-fork.2
+
+### Features
+
+* Local-folder sandboxes: `sandbox.create` accepts `localPath` (absolute or `~/`) instead of `repoUrl`, bind-mounts it read-write at `/workspace/<folder name>` (or `target`) and opens it there without cloning. The Sandboxes screen defaults to **Local folder** and lists the folder and its sandbox path.
+* `mounts` (`source`, `target`, `readOnly` default true) in the host config for every sandbox, and in a local folder's `.paseo/sandbox.json`. A repository's `.paseo/sandbox.json` with `mounts` is refused.
+* A local folder's `.paseo/sandbox.json`, `.paseo.Dockerfile` and build context are read in place, uncommitted files included.
+* A changed mount set recreates the container on the next start and keeps `/home/paseo`.
+
 ## 0.4.0-fork.1 (fork of 0.3.0)
 
 ### Features

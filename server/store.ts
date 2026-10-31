@@ -7,7 +7,12 @@ import { z } from "zod";
 const sandboxRecordSchema = z.object({
   id: z.string(),
   name: z.string(),
-  repoUrl: z.string(),
+  /** The cloned repository, or null for a local-folder sandbox. */
+  repoUrl: z.string().nullable(),
+  /** Host folder mounted read-write as the project, or null for a repository sandbox. */
+  localPath: z.string().nullable().default(null),
+  /** Where `localPath` is mounted in the sandbox and opened as the project. */
+  localTarget: z.string().nullable().default(null),
   /** Opaque to everything but the provider that issued it; null until the first `up`. */
   handle: z.string().nullable(),
   /** The credential revision the sandbox was last started with. */

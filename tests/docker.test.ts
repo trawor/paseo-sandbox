@@ -228,6 +228,25 @@ describe("up", () => {
     expect(docker.volumes.has("paseo-sandbox-abc-home")).toBe(true);
   });
 
+  test("a changed mount set (new revision) recreates the container and keeps the volume", async () => {
+    const provider = createDockerProvider(docker.cli);
+    const project = { source: "/Users/t/app", target: "/workspace/app", readOnly: false };
+    await provider.up({ ...spec, mounts: [project] }, phases);
+    docker.calls = [];
+
+    const data = { source: "/Users/t/data", target: "/data", readOnly: true };
+    await provider.up({ ...spec, revision: "r1+mounts", mounts: [project, data] }, phases);
+
+    expect(docker.verbs()).toContain("container rm");
+    expect(docker.verbs()).not.toContain("volume rm");
+    const run = docker.calls.find((call) => call.args[0] === "run")?.args ?? [];
+    expect(run.filter((_, index) => run[index - 1] === "--mount")).toEqual([
+      "type=bind,source=/Users/t/app,target=/workspace/app",
+      "type=bind,source=/Users/t/data,target=/data,readonly",
+    ]);
+    expect(run).toContain("paseo-sandbox-abc-home:/home/paseo");
+  });
+
   test("a sandbox that never became healthy is removed with its data", async () => {
     docker.health = "unhealthy";
     await expect(createDockerProvider(docker.cli).up(spec, phases)).rejects.toThrow("unhealthy");

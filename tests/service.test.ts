@@ -1,4 +1,4 @@
-import { mkdtemp } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, expect, test, vi } from "vitest";
@@ -57,7 +57,9 @@ class FakeProvider implements SandboxProvider {
       const detail = this.failOn.message === "LEAK" ? await this.leak() : this.failOn.message;
       throw new Error(`exec failed ${detail}`);
     }
-    if (request.argv[0] === "test") throw new Error("missing");
+    // Nothing is cloned yet; mounted local folders are always there.
+    if (request.argv[0] === "test" && request.argv.at(-1)?.startsWith("/home/paseo/"))
+      throw new Error("missing");
     if (request.argv[0] !== "paseo") return "";
     // A recreated sandbox can be offered another relay, so the connection can change.
     const relay = { endpoint: `relay${this.pairings++}.example.test:443`, useTls: true };
@@ -344,6 +346,8 @@ describe("sandbox lifecycle", () => {
         id: "orphan",
         name: "o",
         repoUrl: "https://github.com/a/b",
+        localPath: null,
+        localTarget: null,
         handle: null,
         revision: null,
         password: "p",
@@ -416,6 +420,7 @@ describe("project images", () => {
           source: "the project's .paseo.Dockerfile at abc123",
         },
         env: { RUST_LOG: "info", ANTHROPIC_API_KEY: "from-project" },
+        mounts: [],
       },
     };
     const store = new Store(join(await mkdtemp(join(tmpdir(), "sandbox-images-")), "state.json"));
@@ -454,7 +459,12 @@ describe("project images", () => {
     });
 
     expect(t.images.requests).toEqual([
-      { repoUrl: "https://github.com/a/b", githubToken: "ghp_saved", rebuild: false },
+      {
+        repoUrl: "https://github.com/a/b",
+        localPath: null,
+        githubToken: "ghp_saved",
+        rebuild: false,
+      },
     ]);
     const [spec] = t.provider.ups;
     expect(spec?.image?.source).toBe("the project's .paseo.Dockerfile at abc123");
@@ -490,5 +500,132 @@ describe("project images", () => {
       expect((await t.service.list(t.hosts)).sandboxes[0]?.error).toContain("not valid JSON");
     });
     expect(t.provider.ups).toEqual([]);
+  });
+});
+
+describe("local-folder sandboxes", () => {
+  async function folder(name = "my-app") {
+    const dir = join(await mkdtemp(join(tmpdir(), "sandbox-local-")), name);
+    await mkdir(dir);
+    return realpath(dir);
+  }
+
+  async function localHarness(mounts: ResolvedImage["mounts"] = []) {
+    const store = new Store(join(await mkdtemp(join(tmpdir(), "sandbox-local-")), "state.json"));
+    const provider = new FakeProvider(async () => "");
+    const requests: Parameters<ProjectImages["resolve"]>[0][] = [];
+    const current = { mounts };
+    const service = createSandboxService(
+      provider,
+      store,
+      { mounts: async () => [], githubToken: async () => "" },
+      {
+        async resolve(input) {
+          requests.push(input);
+          return {
+            request: { recipe: { kind: "builtin" }, source: "the built-in runtime" },
+            env: {},
+            mounts: current.mounts,
+            dispose: async () => undefined,
+          };
+        },
+      },
+    );
+    const hosts = new FakeHosts();
+    const idle = () =>
+      vi.waitFor(async () => {
+        const [item] = (await service.list(hosts)).sandboxes;
+        expect(item?.busy).toBeNull();
+      });
+    return { store, provider, service, hosts, requests, current, idle };
+  }
+
+  test("a local folder is mounted read-write and opened in place, never cloned", async () => {
+    const dir = await folder();
+    const t = await localHarness();
+    await t.service.create(t.hosts, { localPath: dir });
+    await t.idle();
+
+    const [item] = (await t.service.list(t.hosts)).sandboxes;
+    expect(item).toMatchObject({
+      name: "my-app",
+      repoUrl: null,
+      localPath: dir,
+      localTarget: "/workspace/my-app",
+      error: null,
+    });
+    expect(t.provider.ups[0]?.mounts).toEqual([
+      { source: dir, target: "/workspace/my-app", readOnly: false },
+    ]);
+    expect(t.requests[0]).toMatchObject({ repoUrl: null, localPath: dir });
+    expect(t.provider.commands().some((command) => command.startsWith("git clone"))).toBe(false);
+    expect(t.hosts.opened).toEqual(["/workspace/my-app"]);
+  });
+
+  test("exactly one source is accepted, and a bad folder creates nothing", async () => {
+    const t = await localHarness();
+    await expect(t.service.create(t.hosts, { repoUrl: "a/b", localPath: "/tmp" })).rejects.toThrow(
+      "either a repository or a local folder",
+    );
+    await expect(t.service.create(t.hosts, {})).rejects.toThrow("either");
+    await expect(t.service.create(t.hosts, { localPath: "/nope/missing" })).rejects.toThrow(
+      "does not exist",
+    );
+    await expect(
+      t.service.create(t.hosts, { localPath: await folder(), target: "/home/paseo/app" }),
+    ).rejects.toThrow("/home/paseo");
+    expect(Object.keys((await t.store.read()).sandboxes)).toEqual([]);
+  });
+
+  test("config mounts join the project mount, and changing them recreates through the revision", async () => {
+    const dir = await folder();
+    const data = await folder("data");
+    const t = await localHarness();
+    const { id } = await t.service.create(t.hosts, { localPath: dir, target: "/srv/app" });
+    await t.idle();
+
+    t.current.mounts = [
+      { source: data, target: "/data", readOnly: true, origin: ".paseo/sandbox.json mounts[0]" },
+    ];
+    await t.service.start(t.hosts, id);
+    await t.idle();
+
+    expect(t.provider.ups[1]?.mounts).toEqual([
+      { source: dir, target: "/srv/app", readOnly: false },
+      { source: data, target: "/data", readOnly: true },
+    ]);
+    expect(t.provider.ups[1]?.revision).not.toBe(t.provider.ups[0]?.revision);
+    expect(t.hosts.opened.at(-1)).toBe("/srv/app");
+  });
+
+  test("a config mount on the project's own path is refused with both names", async () => {
+    const dir = await folder();
+    const t = await localHarness([
+      {
+        source: dir,
+        target: "/workspace/my-app",
+        readOnly: true,
+        origin: "/p/config.json mounts[0]",
+      },
+    ]);
+    await t.service.create(t.hosts, { localPath: dir });
+    await vi.waitFor(async () => {
+      expect((await t.service.list(t.hosts)).sandboxes[0]?.error).toContain(
+        "/p/config.json mounts[0].target /workspace/my-app is already mounted by the local project folder",
+      );
+    });
+    expect(t.provider.ups).toEqual([]);
+  });
+
+  test("a folder removed after creation fails the next start with the reason", async () => {
+    const dir = await folder();
+    const t = await localHarness();
+    const { id } = await t.service.create(t.hosts, { localPath: dir });
+    await t.idle();
+    await rm(dir, { recursive: true });
+    await t.service.start(t.hosts, id);
+    await vi.waitFor(async () => {
+      expect((await t.service.list(t.hosts)).sandboxes[0]?.error).toContain("does not exist");
+    });
   });
 });

@@ -1,0 +1,8 @@
+{
+  "dockerfile": ".paseo.Dockerfile",
+  "env": { "PIP_DISABLE_PIP_VERSION_CHECK": "1" },
+  "mounts": [
+    { "source": "~/datasets", "target": "/data" },
+    { "source": "~/.cache/pip", "target": "/opt/pip-cache", "readOnly": false }
+  ]
+}
