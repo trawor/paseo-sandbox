@@ -1,22 +1,10 @@
 {
-  "name": "@omercnet/paseo-sandbox",
-  "version": "0.3.0",
+  "name": "@trawor/paseo-sandbox",
+  "version": "0.4.0-fork.1",
   "type": "module",
-  "description": "Run a project's Paseo workspaces, agents and terminals inside an isolated sandbox.",
+  "description": "Run a project's Paseo workspaces, agents and terminals inside an isolated sandbox, with a per-project runtime image (.paseo.Dockerfile / .paseo/sandbox.json). Fork of @omercnet/paseo-sandbox.",
   "license": "MIT",
-  "author": "Omer Cohen",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/omercnet/paseo-plugins.git",
-    "directory": "sandbox"
-  },
-  "homepage": "https://github.com/omercnet/paseo-plugins/tree/main/sandbox#readme",
-  "bugs": {
-    "url": "https://github.com/omercnet/paseo-plugins/issues"
-  },
-  "publishConfig": {
-    "access": "public"
-  },
+  "author": "Omer Cohen (original); fork by Travis Wang",
   "packageManager": "bun@1.4.4",
   "engines": {
     "node": ">=24"
@@ -38,7 +26,8 @@
     "runtime",
     "paseo-plugin.json",
     "icon.png",
-    "OVERVIEW.md"
+    "OVERVIEW.md",
+    "examples"
   ],
   "scripts": {
     "check": "biome check .",
@@ -61,5 +50,6 @@
     "typescript": "^7.0.2",
     "vitest": "^5.0.0",
     "zod": "4.4.3"
-  }
+  },
+  "private": true
 }

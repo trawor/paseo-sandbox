@@ -2,6 +2,7 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, expect, test, vi } from "vitest";
+import type { ResolvedImage } from "../server/project-image";
 import type {
   ExecRequest,
   HostMount,
@@ -11,7 +12,7 @@ import type {
   SandboxSpec,
 } from "../server/provider";
 import { parseRepository } from "../server/repository";
-import { createSandboxService, type SandboxService } from "../server/service";
+import { createSandboxService, type ProjectImages, type SandboxService } from "../server/service";
 import { Store } from "../server/store";
 import { FakeHosts } from "./support";
 
@@ -388,5 +389,106 @@ describe("sandbox lifecycle", () => {
     h.provider.problem = "Docker is not running.";
     await expect(create()).rejects.toThrow("Docker is not running.");
     expect(Object.keys((await h.store.read()).sandboxes)).toEqual([]);
+  });
+});
+
+describe("project images", () => {
+  interface ImageHarness {
+    requests: Parameters<ProjectImages["resolve"]>[0][];
+    disposed: number;
+    next: Omit<ResolvedImage, "dispose"> | Error;
+  }
+
+  async function withImages() {
+    const images: ImageHarness = {
+      requests: [],
+      disposed: 0,
+      next: {
+        request: {
+          recipe: {
+            kind: "dockerfile",
+            dockerfile: `ARG BASE_IMAGE\nFROM \${BASE_IMAGE}\n`,
+            context: null,
+            buildArgs: {},
+            extendsBuiltin: true,
+            contextDigest: "",
+          },
+          source: "the project's .paseo.Dockerfile at abc123",
+        },
+        env: { RUST_LOG: "info", ANTHROPIC_API_KEY: "from-project" },
+      },
+    };
+    const store = new Store(join(await mkdtemp(join(tmpdir(), "sandbox-images-")), "state.json"));
+    const provider = new FakeProvider(async () => "");
+    const service = createSandboxService(
+      provider,
+      store,
+      { mounts: async () => [], githubToken: async () => "gho_host" },
+      {
+        async resolve(input) {
+          images.requests.push(input);
+          if (images.next instanceof Error) throw images.next;
+          return {
+            ...images.next,
+            dispose: async () => {
+              images.disposed++;
+            },
+          };
+        },
+      },
+    );
+    return { images, store, provider, service, hosts: new FakeHosts() };
+  }
+
+  test("the resolved image and project env reach the provider; saved credentials win", async () => {
+    const t = await withImages();
+    await t.store.update((draft) => {
+      draft.credentials.ANTHROPIC_API_KEY = { value: "sk-saved", savedAt: "2026-01-01" };
+      draft.credentials.GITHUB_TOKEN = { value: "ghp_saved", savedAt: "2026-01-01" };
+    });
+    const { id } = await t.service.create(t.hosts, { name: "n", repoUrl: "a/b" });
+    await vi.waitFor(async () => {
+      const [item] = (await t.service.list(t.hosts)).sandboxes;
+      expect(item?.busy).toBeNull();
+      expect(item?.error).toBeNull();
+    });
+
+    expect(t.images.requests).toEqual([
+      { repoUrl: "https://github.com/a/b", githubToken: "ghp_saved", rebuild: false },
+    ]);
+    const [spec] = t.provider.ups;
+    expect(spec?.image?.source).toBe("the project's .paseo.Dockerfile at abc123");
+    expect(spec?.env.RUST_LOG).toBe("info");
+    expect(spec?.env.ANTHROPIC_API_KEY).toBe("sk-saved");
+    expect(t.images.disposed).toBe(1);
+    // The project env is part of the provider revision but not of the credential revision.
+    const record = (await t.store.read()).sandboxes[id];
+    expect(spec?.revision).not.toBe(record?.revision);
+    expect((await t.service.list(t.hosts)).sandboxes[0]?.stale).toBe(false);
+  });
+
+  test("changed project env changes the provider revision; rebuild is passed through", async () => {
+    const t = await withImages();
+    const { id } = await t.service.create(t.hosts, { name: "n", repoUrl: "a/b" });
+    const idle = () =>
+      vi.waitFor(async () => {
+        expect((await t.service.list(t.hosts)).sandboxes[0]?.busy).toBeNull();
+      });
+    await idle();
+    if (!(t.images.next instanceof Error)) t.images.next.env = { RUST_LOG: "debug" };
+    await t.service.start(t.hosts, id, { rebuild: true });
+    await idle();
+    expect(t.images.requests.at(-1)?.rebuild).toBe(true);
+    expect(t.provider.ups[1]?.revision).not.toBe(t.provider.ups[0]?.revision);
+  });
+
+  test("a project image problem stops the start with its reason and creates nothing", async () => {
+    const t = await withImages();
+    t.images.next = new Error(".paseo/sandbox.json is not valid JSON: Unexpected token");
+    await t.service.create(t.hosts, { name: "n", repoUrl: "a/b" });
+    await vi.waitFor(async () => {
+      expect((await t.service.list(t.hosts)).sandboxes[0]?.error).toContain("not valid JSON");
+    });
+    expect(t.provider.ups).toEqual([]);
   });
 });

@@ -12,6 +12,35 @@ export interface HostMount {
   readOnly: boolean;
 }
 
+/**
+ * Which runtime image a sandbox runs. Resolved on the Paseo host before the sandbox is created,
+ * because the project itself is only cloned inside the sandbox afterwards.
+ */
+export type ImageRecipe =
+  | { kind: "builtin" }
+  | {
+      kind: "dockerfile";
+      /** Dockerfile text. Built from stdin, so it never has to live in the context. */
+      dockerfile: string;
+      /** Absolute host folder sent as the build context, or null for a context-free build. */
+      context: string | null;
+      /** Non-secret build arguments. `BASE_IMAGE` is added when `extendsBuiltin` is set. */
+      buildArgs: Readonly<Record<string, string>>;
+      /** Build the built-in runtime image first and pass its tag as `BASE_IMAGE`. */
+      extendsBuiltin: boolean;
+      /** Digest of the context folder's files and modes, or "" without a context. */
+      contextDigest: string;
+    }
+  | { kind: "image"; image: string };
+
+export interface ImageRequest {
+  recipe: ImageRecipe;
+  /** Plain words shown while the image is prepared, e.g. "the project's .paseo.Dockerfile". */
+  source: string;
+  /** Rebuild without the layer cache (or pull again) even when the tag already exists. */
+  rebuild?: boolean;
+}
+
 export interface SandboxSpec {
   /** Stable, unique per sandbox; the provider derives resource names from it. */
   key: string;
@@ -21,6 +50,8 @@ export interface SandboxSpec {
   env: Readonly<Record<string, string>>;
   /** Host folders to share. Changing them changes `revision`. */
   mounts: readonly HostMount[];
+  /** The runtime image; the provider's built-in image when absent. A new image recreates it. */
+  image?: ImageRequest;
 }
 
 export type SandboxRuntimeStatus = "running" | "stopped" | "missing";

@@ -2,13 +2,18 @@ import { beforeEach, describe, expect, test } from "vitest";
 import { type DockerCli, DockerError, type DockerOptions } from "../server/docker/cli";
 import { IMAGE_TAG } from "../server/docker/image";
 import { createDockerProvider } from "../server/docker/provider";
+import { imageTag } from "../server/docker/recipe";
+import type { ImageRecipe, ImageRequest } from "../server/provider";
 
 interface FakeContainer {
   state: "running" | "exited";
   image: string;
+  imageId: string;
   revision: string;
   health: "healthy" | "unhealthy";
 }
+
+const HEALTHY_CONTRACT = "missing:\nagents:\n";
 
 interface Call {
   args: readonly string[];
@@ -18,6 +23,13 @@ interface Call {
 /** An in-memory Docker: containers, volumes and images, with the answers the CLI would give. */
 class FakeDocker {
   images = new Set<string>();
+  /** Image ids by tag; a rebuild gives a tag a new id. */
+  imageIds = new Map<string, string>();
+  /** Tags whose image has no HEALTHCHECK. */
+  noHealthcheck = new Set<string>();
+  /** What the runtime-contract check prints inside a candidate image. */
+  contract = HEALTHY_CONTRACT;
+  private builds = 0;
   volumes = new Set<string>();
   containers = new Map<string, FakeContainer>();
   calls: Call[] = [];
@@ -31,10 +43,26 @@ class FakeDocker {
     if (this.daemonDown)
       throw new DockerError("docker version failed", "Cannot connect to the Docker daemon");
     if (group === "version") return ok("27");
-    if (group === "image" && verb === "inspect")
-      return this.require(this.images.has(name), "image");
+    if (group === "image" && verb === "inspect") {
+      this.require(this.images.has(name), "image");
+      const format = args[args.indexOf("--format") + 1] ?? "";
+      if (format.includes("Healthcheck"))
+        return ok(this.noHealthcheck.has(name) ? "null\n" : '{"Test":["CMD","true"]}\n');
+      return ok(format.includes(".Id") ? `${this.idOf(name)}\n` : "");
+    }
+    if (group === "image" && verb === "rm") {
+      this.images.delete(name);
+      return ok("");
+    }
     if (group === "build") {
-      this.images.add(IMAGE_TAG);
+      const tag = args[args.indexOf("--tag") + 1] ?? "";
+      this.images.add(tag);
+      this.imageIds.set(tag, `sha256:build${++this.builds}`);
+      return ok("");
+    }
+    if (group === "pull") {
+      this.images.add(name);
+      this.imageIds.set(name, `sha256:pull${++this.builds}`);
       return ok("");
     }
     if (group === "volume" && verb === "inspect")
@@ -53,17 +81,23 @@ class FakeDocker {
     throw new Error(`Unhandled docker call: ${args.join(" ")}`);
   };
 
+  idOf(tag: string) {
+    return this.imageIds.get(tag) ?? `sha256:${tag}`;
+  }
+
   private require(present: boolean, kind: string) {
     if (!present) throw missing(kind, "x");
     return ok("");
   }
 
   private run(args: readonly string[], options: DockerOptions) {
+    if (args.includes("--rm")) return ok(this.contract);
     const name = args[args.indexOf("--name") + 1] ?? "";
     const label = args.find((arg) => arg.includes("sandbox.revision=")) ?? "";
     this.containers.set(name, {
       state: "running",
       image: args.at(-1) ?? "",
+      imageId: this.idOf(args.at(-1) ?? ""),
       revision: label.split("=")[1] ?? "",
       health: this.health,
     });
@@ -83,7 +117,7 @@ class FakeDocker {
       const format = args[args.indexOf("--format") + 1] ?? "";
       const text = format.includes("Health")
         ? `${found.state} ${found.health}`
-        : [found.state, found.image, found.revision].join("|");
+        : [found.state, found.image, found.revision, found.imageId].join("|");
       return ok(text);
     }
     return ok("");
@@ -256,5 +290,158 @@ describe("cleanup and availability", () => {
       throw new DockerError("Docker is not installed on the Paseo host", "");
     });
     expect(await provider.unavailable()).toContain("not installed");
+  });
+});
+
+function projectImage(
+  dockerfile: string,
+  extra: Partial<ImageRecipe & { kind: "dockerfile" }> = {},
+) {
+  const recipe: ImageRecipe = {
+    kind: "dockerfile",
+    dockerfile,
+    context: null,
+    buildArgs: {},
+    extendsBuiltin: true,
+    contextDigest: "",
+    ...extra,
+  };
+  return { recipe, source: "the project's .paseo.Dockerfile" } satisfies ImageRequest;
+}
+
+const PROJECT = `ARG BASE_IMAGE\nFROM \${BASE_IMAGE}\nRUN apt-get install -y gh\n`;
+
+describe("project images", () => {
+  test("builds the built-in image first, then the project's on top of it via BASE_IMAGE", async () => {
+    docker.images.clear();
+    const seen: string[] = [];
+    const image = projectImage(PROJECT, { buildArgs: { PYTHON: "3.12" } });
+    await createDockerProvider(docker.cli).up({ ...spec, image }, (phase) => seen.push(phase));
+
+    const builds = docker.calls.filter((call) => call.args[0] === "build");
+    expect(builds.map((call) => call.args[builds[0] === call ? 2 : 3])).toEqual([
+      IMAGE_TAG,
+      imageTag(image.recipe),
+    ]);
+    const project = builds[1];
+    expect(project?.options.stdin).toBe(PROJECT);
+    expect(project?.args).toContain(`BASE_IMAGE=${IMAGE_TAG}`);
+    expect(project?.args).toContain("PYTHON=3.12");
+    expect(project?.args.at(-1)).toBe("-");
+    expect(imageTag(image.recipe)).toMatch(/^paseo-sandbox-project:[0-9a-f]{12}$/);
+    const run = docker.calls.find((call) => call.args[0] === "run" && !call.args.includes("--rm"));
+    expect(run?.args.at(-1)).toBe(imageTag(image.recipe));
+    expect(seen).toContain("Building the sandbox image from the project's .paseo.Dockerfile");
+    expect(seen.some((phase) => phase.startsWith("Checking the image"))).toBe(true);
+  });
+
+  test("a configured context is sent with the Dockerfile on stdin", async () => {
+    const image = projectImage(PROJECT, { context: "/tmp/ctx", contextDigest: "abc" });
+    await createDockerProvider(docker.cli).up({ ...spec, image }, phases);
+    const build = docker.calls.find((call) => call.args[0] === "build");
+    expect(build?.args.slice(-3)).toEqual(["--file", "-", "/tmp/ctx"]);
+  });
+
+  test("a Dockerfile that does not extend the built-in image never builds it", async () => {
+    docker.images.clear();
+    const image = projectImage("FROM my/paseo-runtime:1\n", { extendsBuiltin: false });
+    await createDockerProvider(docker.cli).up({ ...spec, image }, phases);
+    const builds = docker.calls.filter((call) => call.args[0] === "build");
+    expect(builds).toHaveLength(1);
+    expect(builds[0]?.args.join(" ")).not.toContain("BASE_IMAGE");
+  });
+
+  test("the tag follows the Dockerfile, build args, context and base", () => {
+    const base = projectImage(PROJECT).recipe;
+    expect(imageTag(base)).toBe(imageTag(projectImage(PROJECT).recipe));
+    expect(imageTag(projectImage(`${PROJECT}RUN true\n`).recipe)).not.toBe(imageTag(base));
+    expect(imageTag(projectImage(PROJECT, { buildArgs: { A: "1" } }).recipe)).not.toBe(
+      imageTag(base),
+    );
+    expect(imageTag(projectImage(PROJECT, { contextDigest: "x" }).recipe)).not.toBe(imageTag(base));
+    expect(imageTag(projectImage(PROJECT, { extendsBuiltin: false }).recipe)).not.toBe(
+      imageTag(base),
+    );
+    expect(imageTag({ kind: "builtin" })).toBe(IMAGE_TAG);
+  });
+
+  test("an edited Dockerfile builds once and recreates the sandbox, keeping its volume", async () => {
+    const provider = createDockerProvider(docker.cli);
+    await provider.up({ ...spec, image: projectImage(PROJECT) }, phases);
+    docker.calls = [];
+    const seen: string[] = [];
+
+    const edited = projectImage(`${PROJECT}RUN pip install ruff\n`);
+    await provider.up({ ...spec, image: edited }, (phase) => seen.push(phase));
+
+    expect(docker.verbs(1).filter((verb) => verb === "build")).toHaveLength(1);
+    expect(docker.verbs()).toContain("container rm");
+    expect(docker.verbs()).not.toContain("volume rm");
+    expect(seen).toContain("Switching to the new runtime image");
+    expect(docker.containers.get("paseo-sandbox-abc")?.image).toBe(imageTag(edited.recipe));
+    expect(docker.volumes.has("paseo-sandbox-abc-home")).toBe(true);
+
+    // Unchanged on the next start: no build and no recreation.
+    docker.calls = [];
+    await provider.up({ ...spec, image: edited }, phases);
+    expect(docker.verbs(1)).not.toContain("build");
+    expect(docker.verbs()).not.toContain("container rm");
+  });
+
+  test("switching from the built-in image to a project image recreates the sandbox", async () => {
+    const provider = createDockerProvider(docker.cli);
+    await provider.up(spec, phases);
+    docker.calls = [];
+    await provider.up({ ...spec, image: projectImage(PROJECT) }, phases);
+    expect(docker.verbs()).toContain("container rm");
+  });
+
+  test("rebuild skips the layer cache, and the new image id recreates the sandbox", async () => {
+    const provider = createDockerProvider(docker.cli);
+    const image = projectImage(PROJECT);
+    await provider.up({ ...spec, image }, phases);
+    docker.calls = [];
+
+    await provider.up({ ...spec, image: { ...image, rebuild: true } }, phases);
+
+    const build = docker.calls.find((call) => call.args[0] === "build");
+    expect(build?.args).toContain("--no-cache");
+    // Only the project image is rebuilt; the pinned built-in image is reused.
+    expect(docker.verbs(1).filter((verb) => verb === "build")).toHaveLength(1);
+    expect(docker.verbs()).toContain("container rm");
+  });
+
+  test("an image that breaks the runtime contract is refused with what is missing", async () => {
+    docker.contract = "missing: user:paseo paseo\nagents: omp\n";
+    const image = projectImage("FROM debian:12\n", { extendsBuiltin: false });
+    const tag = imageTag(image.recipe);
+    docker.noHealthcheck.add(tag);
+
+    const failure = createDockerProvider(docker.cli).up({ ...spec, image }, phases);
+
+    await expect(failure).rejects.toThrow(/does not meet the sandbox runtime contract/);
+    await expect(failure).rejects.toThrow("Missing: HEALTHCHECK, user:paseo, paseo");
+    await expect(failure).rejects.toThrow(`FROM \${BASE_IMAGE}`);
+    expect(docker.images.has(tag)).toBe(false);
+    expect(docker.containers.size).toBe(0);
+  });
+
+  test("missing agent CLIs only warn", async () => {
+    docker.contract = "missing:\nagents: omp opencode\n";
+    const image = projectImage(PROJECT);
+    await expect(createDockerProvider(docker.cli).up({ ...spec, image }, phases)).resolves.toBe(
+      "paseo-sandbox-abc",
+    );
+  });
+
+  test("a prebuilt image is pulled when missing, checked, and run as named", async () => {
+    const image: ImageRequest = {
+      recipe: { kind: "image", image: "ghcr.io/acme/paseo-runtime:2" },
+      source: "the project's .paseo/sandbox.json",
+    };
+    await createDockerProvider(docker.cli).up({ ...spec, image }, phases);
+    expect(docker.verbs(1)).toContain("pull");
+    expect(docker.verbs(1)).not.toContain("build");
+    expect(docker.containers.get("paseo-sandbox-abc")?.image).toBe("ghcr.io/acme/paseo-runtime:2");
   });
 });

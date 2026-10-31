@@ -54,6 +54,13 @@ function SandboxCard({ hostId, theme, sandbox }: SandboxCardProps) {
           onPress={() => toggle.mutate({ id: sandbox.id })}
         />
         <SettingsAction
+          label="Rebuild image"
+          hint="Rebuilds the project's .paseo.Dockerfile image without cache (or pulls its image again) and recreates the sandbox. The project data is kept."
+          actionLabel="Rebuild"
+          disabled={Boolean(sandbox.busy) || actions.start.isPending}
+          onPress={() => actions.start.mutate({ id: sandbox.id, rebuild: true })}
+        />
+        <SettingsAction
           label="Remove"
           hint="Deletes the sandbox and its project data"
           actionLabel="Remove"

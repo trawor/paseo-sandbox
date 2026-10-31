@@ -1,4 +1,4 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
 import type { RpcInput } from "@getpaseo/plugin";
 import { CREDENTIAL_PRESETS } from "../shared/credentials";
@@ -7,6 +7,7 @@ import { sandboxEnvironment } from "./credentials";
 import { ENABLE_OMP } from "./daemon-config";
 import type { SandboxHosts } from "./hosts";
 import { relayConnection } from "./pairing";
+import type { ResolvedImage } from "./project-image";
 import type { HostMount, SandboxProvider } from "./provider";
 import { parseRepository } from "./repository";
 import type { Store } from "./store";
@@ -24,11 +25,37 @@ export interface HostLogins {
   githubToken(): Promise<string>;
 }
 
+/** Picks a sandbox's runtime image on the Paseo host, before the sandbox is created. */
+export interface ProjectImages {
+  resolve(input: {
+    repoUrl: string;
+    /** The token the sandbox itself would clone with, for reading a private project's config. */
+    githubToken: string | undefined;
+    rebuild: boolean;
+  }): Promise<ResolvedImage>;
+}
+
+/** The upstream behavior: every sandbox runs the built-in runtime. */
+export const BUILTIN_IMAGES: ProjectImages = {
+  async resolve({ rebuild }) {
+    return {
+      request: { recipe: { kind: "builtin" }, source: "the built-in runtime", rebuild },
+      env: {},
+      dispose: async () => undefined,
+    };
+  },
+};
+
+function sortedJson(values: Record<string, string>) {
+  return JSON.stringify(Object.entries(values).sort(([a], [b]) => a.localeCompare(b)));
+}
+
 /** Lifecycle of project sandboxes. Long operations run in the background and report through `list`. */
 export function createSandboxService(
   provider: SandboxProvider,
   store: Store,
   hostLogins: HostLogins,
+  images: ProjectImages = BUILTIN_IMAGES,
 ) {
   const busy = new Map<string, string>();
   const failures = new Map<string, string>();
@@ -86,7 +113,12 @@ export function createSandboxService(
   }
 
   /** Brings the sandbox up with the current credentials and registers it as a connected host. */
-  async function provision(hosts: SandboxHosts, id: string, setPhase: (phase: string) => void) {
+  async function provision(
+    hosts: SandboxHosts,
+    id: string,
+    setPhase: (phase: string) => void,
+    rebuild: boolean,
+  ) {
     // One snapshot drives the environment, the logins and the recorded revision, so a credential
     // saved meanwhile is reported as stale instead of being half applied.
     const state = await store.read();
@@ -98,7 +130,34 @@ export function createSandboxService(
       hostTokens.add(token);
       env.GITHUB_TOKEN = token;
     }
-    const handle = await provider.up({ key: id, revision, env, mounts }, setPhase);
+    setPhase("Reading the project's sandbox image settings");
+    const image = await images.resolve({
+      repoUrl: current.repoUrl,
+      githubToken: env.GITHUB_TOKEN,
+      rebuild,
+    });
+    let handle: string;
+    try {
+      if (image.request.recipe.kind !== "builtin") setPhase(`Using ${image.request.source}`);
+      // Saved credentials win over project variables, and project variables count as a change.
+      const hasProjectEnv = Object.keys(image.env).length > 0;
+      handle = await provider.up(
+        {
+          key: id,
+          revision: hasProjectEnv
+            ? createHash("sha256")
+                .update(`${revision}\0${sortedJson(image.env)}`)
+                .digest("hex")
+            : revision,
+          env: { ...image.env, ...env },
+          mounts,
+          image: image.request,
+        },
+        setPhase,
+      );
+    } finally {
+      await image.dispose();
+    }
     await store.update((draft) => {
       const target = draft.sandboxes[id];
       if (target) target.handle = handle;
@@ -174,8 +233,13 @@ export function createSandboxService(
     await hosts.openWorkspace(serverId, cwd);
   }
 
-  async function bringUp(hosts: SandboxHosts, id: string, setPhase: (phase: string) => void) {
-    const serverId = await provision(hosts, id, setPhase);
+  async function bringUp(
+    hosts: SandboxHosts,
+    id: string,
+    setPhase: (phase: string) => void,
+    rebuild = false,
+  ) {
+    const serverId = await provision(hosts, id, setPhase, rebuild);
     setPhase("Opening the project");
     await checkout(hosts, id, serverId);
   }
@@ -229,9 +293,12 @@ export function createSandboxService(
       return { id };
     },
 
-    async start(hosts: SandboxHosts, id: string) {
+    /** `rebuild` builds the project image again without the layer cache, or pulls it again. */
+    async start(hosts: SandboxHosts, id: string, options: { rebuild?: boolean } = {}) {
       await record(id);
-      begin(id, "Starting", (setPhase) => bringUp(hosts, id, setPhase));
+      begin(id, options.rebuild ? "Rebuilding" : "Starting", (setPhase) =>
+        bringUp(hosts, id, setPhase, options.rebuild ?? false),
+      );
     },
 
     async stop(id: string) {

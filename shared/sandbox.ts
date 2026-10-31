@@ -52,9 +52,14 @@ export const createSandbox = defineRpc({
   output: z.object({ id: z.string() }),
 });
 
+/**
+ * Starts (or restarts) a sandbox. The image is resolved again from the project first, so an
+ * edited `.paseo.Dockerfile` is built and the sandbox recreated, keeping /home/paseo.
+ * `rebuild` also rebuilds the project image without the layer cache, or pulls it again.
+ */
 export const startSandbox = defineRpc({
   name: "sandbox.start",
-  input: idInput,
+  input: idInput.extend({ rebuild: z.boolean().optional() }),
   output: z.object({}),
 });
 
