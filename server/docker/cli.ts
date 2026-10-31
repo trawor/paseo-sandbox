@@ -35,7 +35,16 @@ function failureMessage(
   if (error.code === "ENOENT")
     return "Docker is not installed on the Paseo host, or `docker` is not on its PATH.";
   if (error.killed && error.signal) return `docker ${args[0]} timed out after ${timeoutMs / 1000}s`;
-  return `docker ${args[0]} failed: ${stderr.trim().split("\n").at(-1) || error.message}`;
+  const missingSource = /bind source path does not exist: (.+)/.exec(stderr);
+  if (missingSource)
+    return `A mounted folder does not exist on the Docker host: ${missingSource[1]?.trim()}. Docker must see the same path as Paseo; on Docker Desktop, make sure it is under a shared folder (Settings, Resources, File sharing).`;
+  // Docker ends many failures with a "Run 'docker run --help'" hint; the reason is above it.
+  const reason = stderr
+    .trim()
+    .split("\n")
+    .filter((line) => line.trim() && !/^Run 'docker .*--help'/.test(line.trim()))
+    .at(-1);
+  return `docker ${args[0]} failed: ${reason || error.message}`;
 }
 
 export function execDocker(
