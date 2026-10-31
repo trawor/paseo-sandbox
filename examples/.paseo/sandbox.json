@@ -1,0 +1,6 @@
+{
+  "dockerfile": "docker/sandbox.Dockerfile",
+  "context": "docker",
+  "buildArgs": { "NODE_TOOLS": "pnpm@10" },
+  "env": { "PIP_DISABLE_PIP_VERSION_CHECK": "1" }
+}

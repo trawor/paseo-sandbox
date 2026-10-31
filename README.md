@@ -1,5 +1,7 @@
 # Sandbox
 
+> Fork of [`@omercnet/paseo-sandbox`](https://github.com/omercnet/paseo-plugins/tree/main/sandbox) 0.3.0 (MIT) that lets each project choose its runtime image with `.paseo.Dockerfile` or `.paseo/sandbox.json`. See [Project runtime images](#project-runtime-images).
+
 A Paseo plugin that runs a project's workspaces, agents and terminals inside a Docker container with its own Paseo daemon. See [OVERVIEW.md](OVERVIEW.md) for behavior and limits.
 
 ## How it works
@@ -28,6 +30,20 @@ To add a provider, implement the interface and pass it to `createSandboxService`
 
 The plugin bundle cannot read sibling files, so `server/docker/image.ts` embeds the Dockerfile. After editing it, run `npm run embed:dockerfile`; a test fails when they differ. The image tag is derived from the file, so an updated plugin builds a new image once.
 
+## Project runtime images
+
+The project is cloned inside the container after the container exists, so the image cannot come from that checkout. `server/project-files.ts` therefore reads the default branch on the Paseo host first: `git clone --depth 1 --filter=blob:none --no-checkout` plus a non-cone sparse checkout of `/.paseo/sandbox.json` and `/.paseo.Dockerfile` into a private temp folder, then `sparse-checkout add` for a configured Dockerfile or context. Only those blobs are downloaded. It reuses the URL parsing of `server/repository.ts` and the GitHub token the sandbox itself clones with, passed as an `http.https://github.com/.extraheader` through `GIT_CONFIG_*` environment variables (never argv, never a file, never sent to another host). Plain git was chosen over the GitHub contents API because the plugin already accepts any https git host, and over a throwaway container because it needs no image before the image is known. Before building, the `.git` folder is removed so a context is plain files; the temp folder is deleted after the build.
+
+`server/project-image.ts` holds the resolution order (project config, `.paseo.Dockerfile`, host default, built-in), the zod schemas of `.paseo/sandbox.json` and the host settings, and the context digest. It returns an `ImageRequest` (`server/provider.ts`): a built-in, Dockerfile or prebuilt-image recipe plus a human-readable source. `server/docker/recipe.ts` turns a recipe into a tag, `paseo-sandbox-project:<sha256(Dockerfile, sorted build args, context digest, built-in tag)[:12]>`, and holds the contract check. `server/docker/provider.ts`:
+
+- builds the built-in image first when the recipe extends it, then the project image with `--build-arg BASE_IMAGE=<built-in tag>`, from stdin (`-`) or with `--file - <context>`;
+- runs the contract check on every non-built-in image (`docker image inspect` for a HEALTHCHECK, then `docker run --rm --network none --entrypoint sh` for user `paseo` uid 1000, `paseo`, `git`, `node`; missing agent CLIs only warn) and untags an image that fails;
+- recreates a container whose image tag or image id differs from the resolved one, so an edited Dockerfile or a rebuild replaces the container and keeps the volume.
+
+Project `env` values join the provider revision (the stored credential revision, and so the "stale" flag, is unchanged). `sandbox.start` takes `rebuild: true` for `--no-cache` (or a fresh pull). `PASEO_SANDBOX_ALLOW_INSECURE_REPOS=1` lets `parseRepository` accept plain `http://` URLs; it exists only for end-to-end tests against a local git server and must not be set otherwise.
+
+Examples: [`examples/.paseo.Dockerfile`](examples/.paseo.Dockerfile), [`examples/.paseo/sandbox.json`](examples/.paseo/sandbox.json) with [`examples/docker/`](examples/docker). Install as root with `HOME=/root` in your Dockerfile: the base image points `HOME` at `/home/paseo`, and root-owned files there end up in the sandbox user's volume.
+
 ## Credentials
 
 Settings are readable by every client, so credentials never go there. `server/store.ts` keeps them in `$PASEO_HOME/plugin-data/sandbox/state.json` (0600) and the RPCs return names and dates only. Evidence behind the delivery choices:
@@ -46,8 +62,15 @@ Nothing here was verified against a paid endpoint; checks used fake keys and obs
 
 ```sh
 bun install
-cd sandbox
 npm run check && npm run typecheck && npm test
+```
+
+Install this fork into a Paseo daemon from a local checkout (there is no npm release):
+
+```sh
+npm pack && mkdir -p ~/paseo-sandbox-fork && tar xzf trawor-paseo-sandbox-*.tgz -C ~/paseo-sandbox-fork --strip-components=1
+paseo plugin remove sandbox   # only if @omercnet/paseo-sandbox is installed: same plugin id
+paseo plugin install ~/paseo-sandbox-fork
 ```
 
 `npm test` runs the unit tests against in-memory fakes. `npm run test:e2e:local` runs `tests/integration/*.local.e2e.test.ts` against real Docker: it builds the runtime image on first use (a few minutes, needs network), then starts, restarts, recreates and removes real containers and clones a public project. It fails, rather than skips, when Docker is unavailable. CI does not run it.
@@ -65,6 +88,7 @@ Remove leftovers with `docker rm -f` and `docker volume rm` on names starting `p
 
 - `shared/`: RPC contracts and the credential presets.
 - `server/provider.ts`: the sandbox-provider interface. `server/docker/`: the Docker implementation (`provider.ts`, `cli.ts`, generated `image.ts`).
+- `server/project-image.ts`, `server/project-files.ts`, `server/docker/recipe.ts`: per-project image resolution, the host-side sparse fetch, tags and the contract check.
 - `server/service.ts`: create, start, stop, remove, pairing, cloning and host registration. `server/hosts.ts` is the slice of connected hosts it uses.
 - `server/credentials.ts`, `server/store.ts`, `server/host-logins.ts`: saved credentials, shared host logins, the sandbox environment and the private state file. `server/pairing.ts`, `server/repository.ts`: relay connection string and project URL parsing.
 - `client/`: the Sandboxes screen, the credentials section shown in Settings, and the sidebar item.

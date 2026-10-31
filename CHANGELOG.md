@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0-fork.1 (fork of 0.3.0)
+
+### Features
+
+* Per-project runtime image: `.paseo/sandbox.json` (dockerfile, context, buildArgs, env, image, extends), then `.paseo.Dockerfile`, then a host default (`plugin-data/sandbox/config.json` or `PASEO_SANDBOX_*` variables), then the built-in image. Project Dockerfiles extend the built-in image through `BASE_IMAGE`.
+* Content-addressed project image tags; an edited Dockerfile recreates the sandbox on the next start and keeps `/home/paseo`.
+* Runtime-contract check for non-built-in images, with the missing pieces in the error.
+* `sandbox.start` accepts `rebuild`, and the Sandboxes screen has a Rebuild image action.
+* `projectDockerfile: off` / `PASEO_SANDBOX_PROJECT_DOCKERFILE=off` switch.
+
 ## [0.3.0](https://github.com/omercnet/paseo-plugins/compare/sandbox-v0.2.1...sandbox-v0.3.0) (2026-10-28)
 
 

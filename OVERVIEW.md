@@ -4,6 +4,59 @@ Open **Sandboxes** in the sidebar, enter a project (`owner/repo` on GitHub or an
 
 The plugin only provisions. Each sandbox is saved as an ordinary connected host, so its connection status, label and metadata can be inspected and edited in the Connected hosts plugin, or with `paseo host`. Starting a sandbox refreshes only its connection and re-enables it; it never rewrites a label or metadata you changed.
 
+## Project runtime images
+
+Each sandbox runs the built-in runtime image unless the project brings its own. When a sandbox is created or started, the plugin reads the project's default branch on this host (a shallow, sparse fetch of only the files below, with the same GitHub token the sandbox clones with) and picks the first match:
+
+1. **`.paseo/sandbox.json`** in the project, a small config file (see below).
+2. **`.paseo.Dockerfile`** at the project root.
+3. **This host's default**, from `plugin-data/sandbox/config.json` under the daemon's Paseo home or the matching environment variables.
+4. **The built-in runtime image.**
+
+A project Dockerfile normally extends the built-in runtime, so it only adds tools:
+
+```Dockerfile
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+USER root
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends gh ripgrep python3 \
+ && rm -rf /var/lib/apt/lists/*
+```
+
+The plugin builds the built-in image first and passes its tag as `BASE_IMAGE`. A Dockerfile that does not mention `BASE_IMAGE` stands alone and must provide the runtime contract itself (Paseo daemon, user `paseo` with uid 1000, git, node, a HEALTHCHECK). Every non-built-in image is checked after it is built or pulled, and one that misses part of the contract is refused with the list of what is missing.
+
+`.paseo/sandbox.json` (every field optional):
+
+```json
+{
+  "dockerfile": "docker/sandbox.Dockerfile",
+  "context": "docker",
+  "buildArgs": { "NODE_TOOLS": "pnpm@10" },
+  "env": { "PIP_DISABLE_PIP_VERSION_CHECK": "1" }
+}
+```
+
+- `dockerfile`: repository path of the Dockerfile, default `.paseo.Dockerfile`.
+- `context`: repository folder sent as the build context, so `COPY` works. Without it the Dockerfile is built with no context, like the built-in image. `"."` fetches the whole default branch.
+- `buildArgs`, `env`: non-secret values only. Names that look like secrets (`*TOKEN*`, `*KEY*`, `*SECRET*`, `*PASSWORD*`) and names the plugin sets are refused. `env` reaches the sandbox daemon; saved credentials win over it.
+- `image`: a prebuilt image to pull and run instead of building (not with `dockerfile` or `context`).
+- `extends`: `builtin` or `none`, to override the `BASE_IMAGE` detection.
+
+An image is built once per content: the tag is a digest of the Dockerfile, build arguments, context files and the built-in image it extends. Start or Restart reads the project again, so after you push a changed Dockerfile the next start builds it and recreates the container, keeping `/home/paseo` (checkout, logins, history). **Rebuild image** on the Sandboxes screen rebuilds without the layer cache (or pulls the image again) and recreates the sandbox the same way. The project checkout inside the sandbox is not pulled by this.
+
+Host settings, in `plugin-data/sandbox/config.json` (environment variables win, both are read at every start):
+
+| Setting | Environment variable | Meaning |
+| --- | --- | --- |
+| `projectDockerfile`: `auto` (default) or `off` | `PASEO_SANDBOX_PROJECT_DOCKERFILE` | `off` never reads project files; every sandbox uses the host default or the built-in image |
+| `defaultDockerfile` (absolute path) | `PASEO_SANDBOX_DEFAULT_DOCKERFILE` | Dockerfile for projects without their own |
+| `defaultContext` (absolute path) | `PASEO_SANDBOX_DEFAULT_CONTEXT` | Build context for that Dockerfile |
+| `defaultImage` | `PASEO_SANDBOX_DEFAULT_IMAGE` | Prebuilt image for projects without their own; wins over `defaultDockerfile` |
+| `defaultBuildArgs` | | Build arguments for `defaultDockerfile` |
+
+Building a project's Dockerfile runs its `RUN` steps on this host's Docker, so with `auto` anyone who can push to a project's default branch chooses what is built here; set `projectDockerfile` to `off` for projects you do not trust.
+
 ## Setup
 
 Requires Paseo 0.13 and Docker on the machine that runs the Paseo daemon. The daemon user must be able to run `docker`. The first sandbox builds a runtime image of about 4.3 GB from the official Paseo image plus the Claude Code, Codex, OpenCode and OMP CLIs (OMP alone is about 1.2 GB with its bundled models and bun runtime), so it needs network access and a few minutes.
@@ -38,6 +91,7 @@ The app reaches a sandbox through Paseo's relay over TLS with end-to-end encrypt
 - A saved value is visible to anyone who can run `docker inspect` on the daemon host, and to every process inside that sandbox.
 - A ChatGPT, Claude or OpenCode login that rotates tokens must not be copied: two holders of one refresh token can log each other out. Share the host's login with the switches above (one file, one lineage), or sign in inside one sandbox: `docker exec -it -u paseo paseo-sandbox-<id> codex login`. That login persists in that sandbox's volume.
 - On macOS Claude keeps its login in the Keychain, not in a folder, so there is nothing to mount.
-- The image has no `gh` CLI, so pull request status and creation are unavailable inside a sandbox. Agents can still push with the GitHub token.
+- The built-in image has no `gh` CLI, so pull request status and creation are unavailable inside a sandbox unless the project's `.paseo.Dockerfile` adds it. Agents can still push with the GitHub token.
+- Project images are read from the default branch, not from the branch checked out inside the sandbox. Old project images are not deleted; remove unused `paseo-sandbox-project:*` tags with `docker image rm` or `docker image prune`.
 - A rejected or revoked key shows up as an error in the agent's conversation. Only the Claude token has a known lifetime.
 - Clients that were already open when a sandbox was removed can keep showing its projects until their cached host data is cleared.
